@@ -1,0 +1,22 @@
+venues:
+  - name: 五四体育中心-室外排球场
+    enabled: true
+    venue_id: 84                   # URL 中的场地ID: /venue/venue-reservation/84
+    priority_slots:
+      - "17:00-18:00"
+      - "18:00-19:00"
+    book_days_ahead: [0]           # 0=今天, 1=明天, 以此类推
+
+  # 扩展其他场地示例
+  - name: B2篮球全场
+    enabled: false
+    venue_id: 12                   # 替换为实际ID
+    priority_slots:
+      - "18:00-19:00"
+    book_days_ahead: [1]
+
+# 定时抢场
+booking_open_time: "12:00"         # 预约开放时间（每天几点开放抢订）
+pre_login_minutes: 3               # 提前几分钟登录并准备好
+
+headless: false
