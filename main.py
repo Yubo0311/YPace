@@ -104,7 +104,10 @@ async def _book_venue_direct(
 
         await asyncio.sleep(0.8)
 
-        clicked = await _click_priority_slots(page, priority_slots)
+        clicked = await _click_priority_slots(
+            page, priority_slots,
+            preferred_courts=venue.get("preferred_courts"),
+        )
         if clicked == 0:
             logger.debug(f"  No available slots on {target}")
             continue

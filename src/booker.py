@@ -78,7 +78,10 @@ async def book_venue(page: Page, venue_config: dict[str, Any], cjy_creds: dict |
         await asyncio.sleep(0.8)  # wait for slot table to refresh
 
         # Click available green slots matching priority_slots (≤ MAX per order)
-        clicked = await _click_priority_slots(page, priority_slots)
+        clicked = await _click_priority_slots(
+            page, priority_slots,
+            preferred_courts=venue_config.get("preferred_courts"),
+        )
         if clicked == 0:
             logger.debug(f"  No available slots on {target_date}")
             continue
@@ -185,26 +188,22 @@ async def _select_date(page: Page, target_date: date) -> bool:
         return False
 
 
-async def _click_priority_slots(page: Page, priority_slots: list[str]) -> int:
+async def _click_priority_slots(
+    page: Page,
+    priority_slots: list[str],
+    preferred_courts: list[int] | None = None,
+) -> int:
     """
-    Table structure (confirmed from DOM):
-      Row 17-like: 场地 | 08:00-09:00 | 09:00-10:00 | ...  (time header)
-      Row 9-like:  1号  | <reserveBlock free> | ...         (court + blocks)
+    Click up to MAX_SLOTS_PER_ORDER slots from priority_slots, all from the
+    SAME court row.
 
-    Available blocks have class 'reserveBlock position free'.
-    The block index within a row matches the corresponding time header cell index.
-
-    Strategy:
-      1. Read the time header row to get current {time → cell_index} mapping.
-      2. If priority times not visible, click the last cell of the header row
-         (the '>' advance button) and retry — up to 25 times.
-      3. Once target times visible, click the matching free blocks from the
-         FIRST court row that has them (same row = same court, max 2 slots).
+    Because the time table only shows ~5 columns at a time and two adjacent
+    slots (e.g. 17:00 and 18:00) may fall in different windows, we handle
+    each slot in a separate scroll pass:
+      Pass 1 – scroll to first priority slot, click it, record which court.
+      Pass 2 – scroll to second priority slot, click it in the SAME court.
     """
-    target_starts = [s.split("-")[0].strip() for s in priority_slots]
-
     async def _read_header() -> dict:
-        """Return {start_time: cell_index} for current visible time header."""
         return await page.evaluate(r"""() => {
             const mapping = {};
             for (const tr of document.querySelectorAll('tr')) {
@@ -219,87 +218,111 @@ async def _click_priority_slots(page: Page, priority_slots: list[str]) -> int:
         }""")
 
     async def _advance() -> str | None:
-        """
-        Click the ivu-icon-ios-arrow-forward icon that lives inside the
-        .arrowWrap div of the LAST visible time cell.  This is a Vue virtual
-        column list — there is no CSS scroll; only clicking the icon works.
-        """
         return await page.evaluate(r"""() => {
-            // Primary: the '>' icon sits inside .arrowWrap in the last time cell
-            const icon = document.querySelector(
-                '.arrowWrap .ivu-icon-ios-arrow-forward'
-            );
+            const icon = document.querySelector('.arrowWrap .ivu-icon-ios-arrow-forward');
             if (icon) { icon.click(); return 'arrowWrap-forward'; }
-
-            // Fallback: any forward icon carrying the Vue component attribute
-            const icon2 = document.querySelector(
-                '[data-v-e6c914f0].ivu-icon-ios-arrow-forward'
-            );
+            const icon2 = document.querySelector('[data-v-e6c914f0].ivu-icon-ios-arrow-forward');
             if (icon2) { icon2.click(); return 'data-v-forward'; }
-
             return null;
         }""")
 
-    # Scroll until at least one priority time is visible
-    prev_header: dict = {}
-    stall = 0
-    for i in range(30):
-        header = await _read_header()
-        logger.debug(f"  [scroll {i}] visible={sorted(header)}  method pending")
-        if any(t in header for t in target_starts):
-            break
-        stall = (stall + 1) if header == prev_header else 0
-        prev_header = header
-        if stall >= 3:
-            logger.debug("  Header unchanged for 3 iterations, giving up")
-            break
-        method = await _advance()
-        logger.debug(f"    advance → {method}")
-        if not method:
-            break
-        await asyncio.sleep(0.3)
-    else:
-        header = await _read_header()
+    async def _scroll_to(target_start: str) -> dict:
+        """Scroll until target_start is visible; return header mapping."""
+        prev: dict = {}
+        stall = 0
+        for i in range(30):
+            header = await _read_header()
+            if target_start in header:
+                logger.debug(f"  [scroll {i}] found '{target_start}' visible={sorted(header)}")
+                return header
+            stall = (stall + 1) if header == prev else 0
+            prev = header
+            if stall >= 3:
+                break
+            method = await _advance()
+            if not method:
+                break
+            await asyncio.sleep(0.3)
+        return await _read_header()
 
-    target_cells = [header[t] for t in target_starts if t in header]
-    logger.debug(f"  target_cells={target_cells}  header={header}")
-
-    if not target_cells:
-        logger.debug("  No priority times visible after scrolling")
-        return 0
-
-    clicked = await page.evaluate(
-        r"""([cellIndices, maxSlots]) => {
-            const courtRows = Array.from(document.querySelectorAll('tr')).filter(
-                tr => tr.querySelectorAll('.reserveBlock').length > 0
-            );
-            for (const tr of courtRows) {
-                const cells = tr.querySelectorAll('td, th');
-                const toClick = [];
-                for (const idx of cellIndices) {
-                    if (toClick.length >= maxSlots) break;
-                    const block = cells[idx]?.querySelector('.reserveBlock');
+    async def _click_slot(col_idx: int, locked_court: int | None,
+                          prefer: list[int]) -> int | None:
+        """
+        Click the free block at col_idx in the best available court row.
+        If locked_court is set, only that court row is eligible.
+        Returns the court number that was clicked, or None.
+        """
+        return await page.evaluate(
+            r"""([colIdx, lockedCourt, preferredCourts]) => {
+                let rows = Array.from(document.querySelectorAll('tr')).filter(
+                    tr => tr.querySelectorAll('.reserveBlock').length > 0
+                );
+                // Annotate court number
+                rows = rows.map(tr => {
+                    const label = (tr.querySelector('td')?.innerText || '').trim();
+                    const m = label.match(/(\d+)/);
+                    return { tr, courtNum: m ? parseInt(m[1]) : 999 };
+                });
+                // Filter to locked court if set
+                if (lockedCourt !== null) {
+                    rows = rows.filter(r => r.courtNum === lockedCourt);
+                }
+                // Sort by preference
+                if (preferredCourts.length > 0) {
+                    rows.sort((a, b) => {
+                        const ai = preferredCourts.indexOf(a.courtNum);
+                        const bi = preferredCourts.indexOf(b.courtNum);
+                        return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+                    });
+                }
+                for (const { tr, courtNum } of rows) {
+                    const cell = tr.querySelectorAll('td, th')[colIdx];
+                    if (!cell) continue;
+                    const block = cell.querySelector('.reserveBlock');
                     if (!block) continue;
                     const cls = block.className || '';
-                    if (!cls.includes('free')) continue;
-                    if (cls.includes('disabled') || cls.includes('active') ||
-                        cls.includes('selected')) continue;
-                    toClick.push(block);
+                    if (!cls.includes('free') || cls.includes('disabled') ||
+                        cls.includes('active') || cls.includes('selected')) continue;
+                    block.click();
+                    return courtNum;
                 }
-                if (!toClick.length) continue;
-                toClick.forEach(b => b.click());
-                return toClick.length;
-            }
-            return 0;
-        }""",
-        [target_cells, MAX_SLOTS_PER_ORDER],
-    )
+                return null;
+            }""",
+            [col_idx, locked_court, prefer or []],
+        )
 
-    if clicked:
-        logger.debug(f"  Clicked {clicked} slot(s)")
-    else:
-        logger.debug("  No free blocks found at target cell indices")
-    return clicked
+    def _norm(t: str) -> str:
+        """Normalize time string to zero-padded HH:MM (e.g. '8:00' → '08:00')."""
+        h, m = t.strip().split(":")
+        return f"{int(h):02d}:{m}"
+
+    target_starts = [_norm(s.split("-")[0]) for s in priority_slots]
+    prefer = preferred_courts or []
+    clicked_count = 0
+    locked_court: int | None = None
+
+    for slot_start in target_starts:
+        if clicked_count >= MAX_SLOTS_PER_ORDER:
+            break
+
+        header = await _scroll_to(slot_start)
+        if slot_start not in header:
+            logger.debug(f"  Could not scroll to '{slot_start}'")
+            continue
+
+        col_idx = header[slot_start]
+        court = await _click_slot(col_idx, locked_court, prefer)
+        if court is None:
+            logger.debug(f"  No free block for '{slot_start}'"
+                         + (f" in court {locked_court}" if locked_court else ""))
+            continue
+
+        clicked_count += 1
+        locked_court = court
+        logger.debug(f"  Clicked '{slot_start}' in {court}号场 (col={col_idx})")
+        await asyncio.sleep(0.4)
+
+    return clicked_count
 
 
 async def _unselect_slots(page: Page) -> None:
